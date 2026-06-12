@@ -1,0 +1,13 @@
+# secrets & config locale — NE JAMAIS committer
+.env
+logs/.ntfy_topic
+
+# données runtime
+logs/
+*.pid
+*.jsonl
+
+# divers
+node_modules/
+.DS_Store
+*.log
