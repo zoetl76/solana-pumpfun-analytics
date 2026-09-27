@@ -14,6 +14,7 @@ from mt5.engine.indicators import (
     macd,
     rsi,
     sma,
+    stddev,
     true_range,
 )
 
@@ -65,6 +66,12 @@ class RsiTests(unittest.TestCase):
     def test_short_series(self):
         self.assertEqual(rsi([1, 2, 3], 14), [None, None, None])
 
+    def test_none_restarts_warmup(self):
+        # Après le None, il faut de nouveau 2 variations valides avant la première valeur.
+        self.assertEqual(rsi([1, None, 3, 4, 5, 6], 2), [None, None, None, None, 100.0, 100.0])
+        # Le résultat après la coupure est identique à un calcul démarré sur le segment valide.
+        self.assertEqual(rsi([1, None, 3, 4, 5, 6], 2)[2:], rsi([3, 4, 5, 6], 2))
+
 
 class AtrTests(unittest.TestCase):
     def test_true_range(self):
@@ -110,6 +117,13 @@ class HighLowCrossTests(unittest.TestCase):
     def test_highest_lowest(self):
         self.assertEqual(highest([1, 3, 2, 5, 4], 3), [None, None, 3.0, 5.0, 5.0])
         self.assertEqual(lowest([1, 3, 2, 5, 4], 3), [None, None, 1.0, 2.0, 2.0])
+
+    def test_invalid_period_raises_value_error(self):
+        for fn in (lambda: highest([1, 2, 3], 0), lambda: lowest([1, 2, 3], 0), lambda: stddev([1, 2, 3], 0),
+                   lambda: highest([1, 2, 3], -1), lambda: sma([1, 2], 0), lambda: ema([1, 2], 0)):
+            with self.assertRaises(ValueError) as ctx:
+                fn()
+            self.assertIn("period", str(ctx.exception))
 
     def test_crossover_crossunder(self):
         a = [1.0, 2.0, 3.0, 2.0, 1.0]

@@ -5,16 +5,29 @@ Modèle d'exécution
 - La stratégie décide à la CLÔTURE de la bougie ``i`` (``on_bar``) ; l'ordre
   est exécuté à l'OUVERTURE de la bougie ``i+1`` : achat au ask
   (``open + spread_points × point``), vente au bid (``open``).
+- Au moment de l'exécution (ouverture de ``i+1``) on rejoue les contrôles du
+  cycle live : spread de la bougie d'exécution (``max_spread``), validité des
+  stops par rapport au bid/ask comme le ferait le serveur MT5
+  (``invalid_stops``) et marge disponible (``margin``, réduction du volume ou
+  refus). Un signal refusé est compté dans ``blocked``.
 - SL/TP vérifiés en intrabar sur le high/low de chaque bougie, avec
   l'asymétrie bid/ask traitée simplement :
   * achat : SL touché si ``low <= sl`` ; TP touché si ``high >= tp`` ;
   * vente : SL touché si ``high + spread >= sl`` ; TP touché si ``low + spread <= tp``.
   Si SL ET TP sont touchés dans la même bougie, on retient le SL (prudent).
+  Si la bougie OUVRE déjà au-delà du niveau (gap de week-end, annonce), la
+  sortie est exécutée au prix d'ouverture, comme un ordre au marché, et non
+  au niveau du stop (raison suffixée « (gap) »).
 - Sortie discrétionnaire (``should_exit`` à la clôture) → exécutée à
   l'ouverture suivante. ``manage`` (trailing) appliqué à chaque clôture.
-- Taille via ``risk.compute_lots`` (même code que le live) sur l'équité courante.
+- Taille via ``risk.compute_lots`` puis ``risk.check_margin`` (même code que
+  le live) sur l'équité courante.
 - PnL (devise du compte) = (sortie − entrée) × lots × contractSize × taux,
   signe selon la direction.
+- Drawdown : calculé sur l'équité valorisée à CHAQUE clôture de bougie
+  (position ouverte évaluée au prix de clôture), pas seulement sur les trades
+  clôturés. ``equity_curve`` ne contient en revanche que les points de
+  clôture de trade (plus le point de départ).
 
 Utilisation en ligne de commande ::
 
@@ -37,11 +50,14 @@ from .candles import Candle, candle_close_time, infer_timeframe, load_candles
 from .risk import (
     Blocked,
     RiskConfig,
+    check_margin,
     compute_lots,
     guard_daily_loss_amount,
     guard_friday_cutoff,
     guard_spread,
     guard_trading_hours,
+    round_lots_down,
+    validate_stops,
 )
 from .strategy import AccountState, Context, ExitSignal, PositionState, Signal, Strategy, SymbolSpec, parse_params_string
 
@@ -231,9 +247,15 @@ class Backtester:
         equity_curve: list[dict[str, Any]] = [
             {"time": candles[0].time.isoformat() if candles else None, "equity": round(balance, 2)}
         ]
+        # Équité « mark-to-market » à chaque clôture (pour le drawdown réel).
+        equity_track: list[float] = [balance]
         realized_by_day: dict[date, float] = {}
         day_start_balance: dict[date, float] = {}
         cache: dict[Any, Any] = {}
+
+        def count_blocked(items: list[Blocked]) -> None:
+            for b in items:
+                blocked_counts[b.rule] = blocked_counts.get(b.rule, 0) + 1
 
         open_trade: _OpenTrade | None = None
         pending_entry: Signal | None = None
@@ -260,6 +282,7 @@ class Backtester:
                 )
             )
             equity_curve.append({"time": exit_time.isoformat(), "equity": round(balance, 2)})
+            equity_track.append(balance)
             day = exit_time.date()
             realized_by_day[day] = realized_by_day.get(day, 0.0) + pnl
             open_trade = None
@@ -273,23 +296,55 @@ class Backtester:
             # 1) Entrée en attente : exécution à l'ouverture de cette bougie.
             if pending_entry is not None and open_trade is None:
                 sig = pending_entry
-                entry_price = bar.open + spread if sig.side == "buy" else bar.open
-                sizing = compute_lots(balance, risk.risk_pct_per_trade, entry_price, sig.sl, spec, risk.profit_ccy_to_account_rate)
-                if sizing.ok:
-                    warnings.extend(f"{bar.time.isoformat()} : {w}" for w in sizing.warnings)
+                pending_entry = None
+                bid, ask = bar.open, bar.open + spread
+                entry_price = ask if sig.side == "buy" else bid
+                sl, tp = spec.round_price(sig.sl), spec.round_price(sig.tp)
+                # Contrôles au moment de l'exécution, comme le cycle live au moment de l'ordre :
+                # spread réellement payé et stops valides par rapport au bid/ask d'exécution.
+                fill_blocked = guard_spread(bar.spread_points, risk.max_spread_points)
+                fill_blocked += validate_stops(sig.side, sl, tp, bid, ask, spec)
+                lots = 0.0
+                if fill_blocked:
+                    count_blocked(fill_blocked)
+                    warnings.append(
+                        f"{bar.time.isoformat()} : signal {sig.side} refusé à l'exécution : "
+                        + " ; ".join(b.detail for b in fill_blocked)
+                    )
+                else:
+                    sizing = compute_lots(balance, risk.risk_pct_per_trade, entry_price, sl, spec, risk.profit_ccy_to_account_rate)
+                    if sizing.ok:
+                        warnings.extend(f"{bar.time.isoformat()} : {w}" for w in sizing.warnings)
+                        lots = sizing.lots
+                        # Marge : sans position ouverte, la marge libre vaut le solde.
+                        margin = check_margin(
+                            lots, entry_price, spec.contract_size, self.leverage, balance,
+                            risk.margin_usage_cap, spec.volume_step,
+                        )
+                        if not margin.ok:
+                            reduced = round_lots_down(margin.max_lots, spec.volume_step)
+                            if reduced >= spec.volume_min:
+                                warnings.append(
+                                    f"{bar.time.isoformat()} : volume réduit de {lots} à {reduced} lot(s) pour la marge : {margin.detail}"
+                                )
+                                lots = reduced
+                            else:
+                                count_blocked([Blocked("margin", margin.detail)])
+                                warnings.append(f"{bar.time.isoformat()} : signal {sig.side} refusé (marge) : {margin.detail}")
+                                lots = 0.0
+                    else:
+                        warnings.append(f"{bar.time.isoformat()} : signal {sig.side} ignoré ({sizing.reason})")
+                if lots > 0:
                     open_trade = _OpenTrade(
                         direction=sig.side,
                         entry_time=bar.time,
                         entry_price=spec.round_price(entry_price) or entry_price,
-                        lots=sizing.lots,
-                        sl=spec.round_price(sig.sl),
-                        tp=spec.round_price(sig.tp),
+                        lots=lots,
+                        sl=sl,
+                        tp=tp,
                         entry_reason=pending_entry_reason,
                         entry_index=i,
                     )
-                else:
-                    warnings.append(f"{bar.time.isoformat()} : signal {sig.side} ignoré ({sizing.reason})")
-                pending_entry = None
 
             # 2) Sortie discrétionnaire en attente : exécution à l'ouverture.
             if pending_exit is not None and open_trade is not None:
@@ -300,16 +355,28 @@ class Backtester:
             # 3) SL / TP en intrabar (SL prioritaire si les deux sont touchés).
             if open_trade is not None:
                 t = open_trade
+                # Un stop déclenché devient un ordre au marché : si la bougie ouvre
+                # déjà au-delà du niveau (gap), la sortie se fait à l'ouverture.
                 if t.direction == "buy":
                     sl_hit = t.sl is not None and bar.low <= t.sl + 1e-12
                     tp_hit = t.tp is not None and bar.high >= t.tp - 1e-12
+                    sl_exit = min(bar.open, float(t.sl)) if sl_hit else None
+                    tp_exit = max(bar.open, float(t.tp)) if tp_hit else None
                 else:
                     sl_hit = t.sl is not None and bar.high + spread >= t.sl - 1e-12
                     tp_hit = t.tp is not None and bar.low + spread <= t.tp + 1e-12
+                    sl_exit = max(bar.open + spread, float(t.sl)) if sl_hit else None
+                    tp_exit = min(bar.open + spread, float(t.tp)) if tp_hit else None
                 if sl_hit:
-                    close_trade(t, bar.time, float(t.sl), "stop loss")
+                    gap = abs(sl_exit - float(t.sl)) > 1e-12
+                    close_trade(t, bar.time, spec.round_price(sl_exit) or sl_exit, "stop loss (gap)" if gap else "stop loss")
                 elif tp_hit:
-                    close_trade(t, bar.time, float(t.tp), "take profit")
+                    gap = abs(tp_exit - float(t.tp)) > 1e-12
+                    close_trade(t, bar.time, spec.round_price(tp_exit) or tp_exit, "take profit (gap)" if gap else "take profit")
+                if open_trade is not None:
+                    # Valorisation à la clôture (achat au bid = close ; vente au ask = close + spread).
+                    mark = bar.close if t.direction == "buy" else bar.close + spread
+                    equity_track.append(balance + self._pnl(t.direction, t.entry_price, mark, t.lots))
 
             # 4) Décisions à la clôture de la bougie i.
             if i + 1 < self.strategy.warmup_bars:
@@ -355,8 +422,7 @@ class Backtester:
                 realized_by_day.get(day, 0.0), day_start_balance.get(day, balance), risk.max_daily_loss_pct
             )
             if blocked:
-                for b in blocked:
-                    blocked_counts[b.rule] = blocked_counts.get(b.rule, 0) + 1
+                count_blocked(blocked)
                 continue
             pending_entry = signal
             pending_entry_reason = signal.reason
@@ -368,7 +434,7 @@ class Backtester:
             exit_price = last.close if open_trade.direction == "buy" else last.close + spread
             close_trade(open_trade, candle_close_time(candles), exit_price, "fin des données")
 
-        return self._stats(trades, balance, equity_curve, blocked_counts, warnings, n)
+        return self._stats(trades, balance, equity_curve, blocked_counts, warnings, n, equity_track)
 
     # -- statistiques -------------------------------------------------------- #
     def _stats(
@@ -379,6 +445,7 @@ class Backtester:
         blocked: dict[str, int],
         warnings: list[str],
         n_bars: int,
+        equity_track: list[float] | None = None,
     ) -> BacktestResult:
         wins = [t.pnl for t in trades if t.pnl > 0]
         losses = [t.pnl for t in trades if t.pnl <= 0]
@@ -388,8 +455,9 @@ class Backtester:
         peak = -float("inf")
         max_dd = 0.0
         max_dd_pct = 0.0
-        for pt in equity_curve:
-            eq = float(pt["equity"])
+        # Drawdown sur l'équité mark-to-market (repli : points de clôture de trade).
+        track = equity_track if equity_track is not None else [float(pt["equity"]) for pt in equity_curve]
+        for eq in track:
             peak = max(peak, eq)
             dd = peak - eq
             if dd > max_dd:
@@ -441,8 +509,28 @@ def run_backtest(
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def build_parser() -> argparse.ArgumentParser:
+class FrenchHelpFormatter(argparse.HelpFormatter):
+    """Formateur d'aide argparse avec le préfixe « utilisation » en français."""
+
+    def _format_usage(self, usage, actions, groups, prefix):  # type: ignore[override]
+        if prefix is None:
+            prefix = "utilisation : "
+        return super()._format_usage(usage, actions, groups, prefix)
+
+
+def french_parser(prog: str, description: str, epilog: str) -> argparse.ArgumentParser:
+    """Crée un ``ArgumentParser`` dont tous les libellés automatiques sont en français."""
     parser = argparse.ArgumentParser(
+        prog=prog, description=description, epilog=epilog, add_help=False, formatter_class=FrenchHelpFormatter,
+    )
+    parser._positionals.title = "arguments"
+    parser._optionals.title = "paramètres"
+    parser.add_argument("-h", "--help", action="help", help="afficher cette aide et quitter")
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = french_parser(
         prog="python3 -m mt5.engine.backtest",
         description="Backteste une stratégie sur un fichier de bougies au format Axi MT5.",
         epilog="Exemple : python3 -m mt5.engine.backtest --strategy ema_cross "

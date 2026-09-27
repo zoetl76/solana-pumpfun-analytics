@@ -12,6 +12,16 @@ Sortie : un JSON d'actions que Claude exécute ensuite via le connecteur ::
      "blocked": [{"rule": "...", "detail": "..."}], "warnings": ["..."],
      "lastCandle": {...}}
 
+Les niveaux ``priceSL``/``priceTP`` des actions sont toujours des nombres :
+``0.0`` signifie « pas de niveau » (convention de ``modify_mt5_position``).
+Les stops sont validés comme par le serveur MT5 (achat : SL sous le bid, TP
+au-dessus ; vente : SL au-dessus du ask, TP en dessous ; distance ≥ stopsLevel).
+
+« Maintenant » (gardes horaires, date de la perte journalière) est pris dans
+l'ordre : ``--now``, ``account.asOf`` (heure de lecture du compte, donc de la
+décision), ``quote.time`` (heure du dernier tick, potentiellement périmée),
+horloge système.
+
 Règle de ré-entrée sans état : le signal de la dernière bougie terminée est
 considéré CONSOMMÉ si une position ouverte sur le symbole a un ``timeCreate``
 supérieur ou égal à l'heure d'ouverture de cette bougie. Jamais plus d'une
@@ -31,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .backtest import load_spec, parse_hours
+from .backtest import french_parser, load_spec, parse_hours
 from .candles import Candle, candle_close_time, candles_from_records, load_candles, parse_time
 from .risk import (
     Blocked,
@@ -46,6 +56,7 @@ from .risk import (
     guard_trade_mode,
     guard_trading_hours,
     round_lots_down,
+    validate_stops,
 )
 from .strategy import (
     AccountState,
@@ -130,6 +141,11 @@ def _levels_changed(old: float | None, new: float | None, point: float) -> bool:
     return abs(new - old) >= point - 1e-12
 
 
+def _level_or_zero(level: float | None) -> float:
+    """``None`` → ``0.0`` : le connecteur exige un nombre (0 = pas de niveau)."""
+    return 0.0 if level is None else float(level)
+
+
 def run_cycle(
     strategy: Strategy,
     symbol: str,
@@ -158,13 +174,22 @@ def run_cycle(
     if quote_raw is None:
         warnings.append("quote.json absent : spread et session inconnus")
 
-    now = now or quote.time or account.as_of or datetime.now(timezone.utc)
+    # account.asOf = heure de la décision ; quote.time = heure du dernier tick (peut être périmé).
+    now = now or account.as_of or quote.time or datetime.now(timezone.utc)
     now = now.astimezone(timezone.utc)
 
     last = candles[-1]
     index = len(candles) - 1
     as_of = candle_close_time(candles)
     point = spec.point
+
+    # Bid/ask de référence pour valider les stops (repli : dernière clôture + spread de la bougie).
+    spread_points = quote.spread_points if quote.spread_points is not None else float(last.spread_points)
+    bid = quote.bid if quote.bid else last.close
+    ask = quote.ask if quote.ask else last.close + spread_points * point
+
+    if fills_raw is None and risk.max_daily_loss_pct and risk.max_daily_loss_pct > 0:
+        warnings.append("fills.json absent : perte journalière non contrôlée (règle max_daily_loss inactive ce cycle)")
 
     enough_bars = len(candles) >= strategy.warmup_bars
     if not enough_bars:
@@ -191,16 +216,24 @@ def run_cycle(
                 continue
             new_sl = spec.round_price(new_levels.get("sl", pos.sl))
             new_tp = spec.round_price(new_levels.get("tp", pos.tp))
-            if _levels_changed(pos.sl, new_sl, point) or _levels_changed(pos.tp, new_tp, point):
-                actions.append(
-                    {
-                        "type": "modify",
-                        "positionId": pos.position_id,
-                        "priceSL": new_sl,
-                        "priceTP": new_tp,
-                        "reason": f"ajustement SL/TP par la stratégie (SL {pos.sl} → {new_sl}, TP {pos.tp} → {new_tp})",
-                    }
-                )
+            if not (_levels_changed(pos.sl, new_sl, point) or _levels_changed(pos.tp, new_tp, point)):
+                continue
+            stops_block = validate_stops(pos.direction, new_sl, new_tp, bid, ask, spec, label=f"modification de {pos.position_id}")
+            if stops_block:
+                blocked += stops_block
+                warnings.append(f"modification de {pos.position_id} non émise : SL/TP invalides par rapport au bid/ask courant")
+                continue
+            if quote.session_open is False:
+                warnings.append(f"session fermée : la modification de {pos.position_id} sera exécutée à la réouverture")
+            actions.append(
+                {
+                    "type": "modify",
+                    "positionId": pos.position_id,
+                    "priceSL": _level_or_zero(new_sl),
+                    "priceTP": _level_or_zero(new_tp),
+                    "reason": f"ajustement SL/TP par la stratégie (SL {pos.sl} → {new_sl}, TP {pos.tp} → {new_tp})",
+                }
+            )
 
     # ---- ouverture ------------------------------------------------------- #
     consumed = any(p.time_open is not None and p.time_open >= last.time for p in positions)
@@ -214,7 +247,6 @@ def run_cycle(
         ctx = Context(candles=candles, index=index, spec=spec, position=None, account=account, cache=cache)
         signal = strategy.on_bar(ctx)
         if signal is not None:
-            spread_points = quote.spread_points if quote.spread_points is not None else float(last.spread_points)
             trade_mode = quote.trade_mode if quote.trade_mode is not None else spec.trade_mode
             blocked += guard_session(quote.session_open, quote.session_opens)
             blocked += guard_trade_mode(trade_mode, signal.side)
@@ -225,16 +257,11 @@ def run_cycle(
             blocked += daily_block
             warnings.extend(daily_warnings)
 
-            if signal.side == "buy":
-                entry_price = quote.ask if quote.ask else last.close + spread_points * point
-            else:
-                entry_price = quote.bid if quote.bid else last.close
+            entry_price = ask if signal.side == "buy" else bid
             sl = spec.round_price(signal.sl)
             tp = spec.round_price(signal.tp)
-            if sl is not None and ((signal.side == "buy" and sl >= entry_price) or (signal.side == "sell" and sl <= entry_price)):
-                blocked.append(Blocked("invalid_stops", f"SL {sl} du mauvais côté du prix d'entrée {entry_price} ({signal.side})"))
-            if tp is not None and ((signal.side == "buy" and tp <= entry_price) or (signal.side == "sell" and tp >= entry_price)):
-                blocked.append(Blocked("invalid_stops", f"TP {tp} du mauvais côté du prix d'entrée {entry_price} ({signal.side})"))
+            # Validation côté serveur MT5 : un achat se clôture au bid, une vente au ask.
+            blocked += validate_stops(signal.side, sl, tp, bid, ask, spec)
 
             if not blocked:
                 sizing = compute_lots(account.equity, risk.risk_pct_per_trade, entry_price, sl, spec, risk.profit_ccy_to_account_rate)
@@ -260,14 +287,15 @@ def run_cycle(
                                 "type": "open",
                                 "direction": signal.side,
                                 "volumeLots": lots,
-                                "priceSL": sl,
-                                "priceTP": tp,
+                                "priceSL": _level_or_zero(sl),
+                                "priceTP": _level_or_zero(tp),
                                 "reason": signal.reason or "signal stratégie",
                             }
                         )
             if blocked:
                 warnings.append(f"signal {signal.side} ({signal.reason}) bloqué par {len(blocked)} règle(s)")
-    elif enough_bars and max_pos_block and not positions:
+    elif enough_bars and max_pos_block and not consumed:
+        # Position(s) déjà ouverte(s) : on ne consulte pas on_bar mais on rend la règle visible.
         blocked += max_pos_block
 
     return {
@@ -312,7 +340,7 @@ def _load_json(path: str | None, label: str, required: bool = True) -> Any:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = french_parser(
         prog="python3 -m mt5.engine.cycle",
         description=(
             "Calcule les actions d'un cycle de trading (sans état, sans réseau) à partir des "
@@ -341,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--friday-cutoff-hour", type=int, default=20, help="plus d'ouverture le vendredi à partir de cette heure UTC (défaut : 20 ; -1 pour désactiver)")
     parser.add_argument("--margin-cap", type=float, default=0.8, help="fraction max de la marge libre utilisable (défaut : 0.8)")
     parser.add_argument("--rate", type=float, default=1.0, help="taux devise de profit → devise du compte (défaut : 1)")
-    parser.add_argument("--now", default=None, help="horodatage ISO à utiliser comme « maintenant » (défaut : heure de la cotation, sinon du compte, sinon horloge)")
+    parser.add_argument("--now", default=None, help="horodatage ISO à utiliser comme « maintenant » (défaut : asOf du compte, sinon heure de la cotation, sinon horloge)")
     parser.add_argument("--out", default=None, help="fichier de sortie des actions (JSON)")
     parser.add_argument("--quiet", action="store_true", help="ne pas afficher le JSON sur la sortie standard")
     return parser

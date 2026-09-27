@@ -98,6 +98,8 @@ def candle_from_dict(record: dict[str, Any]) -> Candle:
     close = _to_float(record, "close", "c")
     if low > high + 1e-12:
         raise ValueError(f"Bougie incohérente (low > high) : {record!r}")
+    if not (low - 1e-12 <= open_ <= high + 1e-12) or not (low - 1e-12 <= close <= high + 1e-12):
+        raise ValueError(f"Bougie incohérente (open/close hors de [low, high]) : {record!r}")
     return Candle(
         time=parse_time(record["time"]),
         open=open_,

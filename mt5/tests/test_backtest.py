@@ -233,6 +233,121 @@ class BacktestScenarioTests(unittest.TestCase):
         self.assertEqual(res.blocked.get("max_daily_loss"), 1)
 
 
+class BacktestExecutionGuardTests(unittest.TestCase):
+    """Contrôles rejoués au moment de l'exécution (parité avec le cycle live)."""
+
+    def test_entry_rejected_when_sl_on_wrong_side_of_fill(self):
+        # Gap baissier : la bougie d'exécution ouvre SOUS le SL du signal → ordre invalide, pas de « stop loss gagnant ».
+        candles = [flat(0), flat(1), mk(2, 1.09000, 1.09600, 1.08900, 1.09500), flat(3, 1.09500)]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09500, tp=1.11000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertEqual(res.n_trades, 0)
+        self.assertEqual(res.blocked.get("invalid_stops"), 1)
+        self.assertTrue(any("refusé" in w for w in res.warnings))
+        # Gap haussier au-dessus du TP → idem (pas de « take profit perdant »).
+        candles = [flat(0), flat(1), mk(2, 1.11500, 1.11600, 1.11400, 1.11500), flat(3, 1.11500)]
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertEqual(res.n_trades, 0)
+        self.assertEqual(res.blocked.get("invalid_stops"), 1)
+        # Vente : SL sous le ask d'exécution.
+        candles = [flat(0), flat(1), mk(2, 1.11000, 1.11100, 1.10900, 1.11000), flat(3, 1.11000)]
+        strat = ScriptedStrategy(entries={1: Signal("sell", sl=1.10500, tp=1.09000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertEqual(res.n_trades, 0)
+        self.assertEqual(res.blocked.get("invalid_stops"), 1)
+
+    def test_margin_check_applied_like_live_cycle(self):
+        # SL à 20 points : 100 USD / (0.00020 × 100 000) = 5 lots ; marge 5 × 110 000 / 100 = 5 500 > 0.8 × 10 000 ?
+        # Non (5 500 ≤ 8 000) → 5 lots ; avec un levier 50 : 11 000 > 8 000 → réduit à 3.63 lots.
+        candles = [flat(0), flat(1), mk(2, 1.10000, 1.10010, 1.09990, 1.10000), flat(3), flat(4)]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09990, tp=1.10500)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000, leverage=100).run()
+        self.assertEqual(res.trades[0].lots, 5.0)
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000, leverage=50).run()
+        self.assertEqual(res.n_trades, 1)
+        self.assertAlmostEqual(res.trades[0].lots, 3.63)
+        self.assertTrue(any("marge" in w for w in res.warnings))
+        # Marge libre insuffisante même pour le volume minimum → refus compté dans blocked.
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 0.5, leverage=1).run()
+        self.assertEqual(res.n_trades, 0)
+        self.assertEqual(res.blocked.get("margin"), 1)
+
+    def test_gap_through_sl_fills_at_open(self):
+        candles = [
+            flat(0), flat(1),
+            mk(2, 1.10000, 1.10050, 1.09950, 1.10000),
+            mk(3, 1.09000, 1.09100, 1.08900, 1.09000),  # ouvre 50 points SOUS le SL 1.09500
+            flat(4, 1.09000),
+        ]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09500, tp=1.11000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        t = res.trades[0]
+        self.assertAlmostEqual(t.exit_price, 1.09000)
+        self.assertEqual(t.reason, "stop loss (gap)")
+        self.assertAlmostEqual(t.pnl, (1.09000 - 1.10010) * t.lots * 100_000, places=6)
+        # Vente : gap haussier → sortie au ask d'ouverture (open + spread), pire que le SL.
+        candles = [
+            flat(0), flat(1),
+            mk(2, 1.10000, 1.10050, 1.09950, 1.10000),
+            mk(3, 1.11000, 1.11100, 1.10900, 1.11000),  # ask 1.11010 > SL 1.10500
+            flat(4, 1.11000),
+        ]
+        strat = ScriptedStrategy(entries={1: Signal("sell", sl=1.10500, tp=1.09000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertAlmostEqual(res.trades[0].exit_price, 1.11010)
+        self.assertEqual(res.trades[0].reason, "stop loss (gap)")
+
+    def test_gap_through_tp_fills_at_open(self):
+        candles = [
+            flat(0), flat(1),
+            mk(2, 1.10000, 1.10050, 1.09950, 1.10000),
+            mk(3, 1.11500, 1.11600, 1.11400, 1.11500),  # ouvre AU-DESSUS du TP 1.11000
+            flat(4, 1.11500),
+        ]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09500, tp=1.11000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertAlmostEqual(res.trades[0].exit_price, 1.11500)
+        self.assertEqual(res.trades[0].reason, "take profit (gap)")
+
+    def test_spread_guard_checked_on_fill_bar(self):
+        candles = [flat(0), flat(1), mk(2, 1.10000, 1.10100, 1.09900, 1.10000, spread=300), flat(3), flat(4)]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09500, tp=1.11000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(max_spread_points=15), 10_000).run()
+        self.assertEqual(res.n_trades, 0)
+        self.assertEqual(res.blocked.get("max_spread"), 1)
+        # Sans limite de spread, le trade est bien pris et paie les 300 points.
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        self.assertAlmostEqual(res.trades[0].entry_price, 1.10300)
+
+    def test_weekend_block_disabled_with_none_cutoff(self):
+        saturday = datetime(2026, 9, 26, 0, 0, tzinfo=timezone.utc)
+        candles = [Candle(saturday + timedelta(hours=i), 1.1, 1.1005, 1.0995, 1.1, 1, 0, 10) for i in range(5)]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.09500, tp=1.11000)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(no_new_trades_friday_after_hour_utc=None), 10_000).run()
+        self.assertEqual(res.n_trades, 1)
+        self.assertEqual(res.blocked, {})
+        res = Backtester(strat, candles, SPEC, RiskConfig(no_new_trades_friday_after_hour_utc=20), 10_000).run()
+        self.assertEqual(res.blocked.get("weekend"), 1)
+
+    def test_floating_drawdown_counted(self):
+        # Le trade plonge (clôture à 1.0901) puis atteint son TP : drawdown flottant non nul.
+        candles = [
+            flat(0), flat(1),
+            mk(2, 1.10000, 1.10050, 1.09950, 1.10000),
+            mk(3, 1.10000, 1.10000, 1.09000, 1.09010),
+            mk(4, 1.09010, 1.10600, 1.09000, 1.10500),
+            flat(5, 1.10500),
+        ]
+        strat = ScriptedStrategy(entries={1: Signal("buy", sl=1.08500, tp=1.10500)})
+        res = Backtester(strat, candles, SPEC, RiskConfig(), 10_000).run()
+        t = res.trades[0]
+        self.assertEqual(t.reason, "take profit")
+        expected_dd = (t.entry_price - 1.09010) * t.lots * 100_000
+        self.assertAlmostEqual(res.max_drawdown_abs, expected_dd, places=6)
+        self.assertAlmostEqual(res.max_drawdown_pct, expected_dd / 10_000, places=9)
+        self.assertEqual(len(res.equity_curve), 2)  # la courbe publiée reste par trade
+
+
 class BacktestCliTests(unittest.TestCase):
     """Les appels CLI sont exécutés avec la sortie standard/erreur capturée."""
 
@@ -264,6 +379,17 @@ class BacktestCliTests(unittest.TestCase):
 
     def test_cli_missing_file(self):
         self.assertEqual(main(["--strategy", "ema_cross", "--candles", "/chemin/inexistant.json"]), 2)
+
+    def test_cli_help_in_french(self):
+        with self.assertRaises(SystemExit) as ctx:
+            main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = self._out.getvalue()
+        self.assertIn("utilisation :", text)
+        self.assertIn("afficher cette aide", text)
+        self.assertNotIn("usage:", text)
+        self.assertNotIn("show this help", text)
+        self.assertNotIn("options:", text)
 
 
 if __name__ == "__main__":

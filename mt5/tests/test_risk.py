@@ -15,9 +15,11 @@ from mt5.engine.risk import (
     guard_trade_mode,
     guard_trading_hours,
     in_trading_hours,
+    is_non_trading_deal,
     realized_pnl_today,
     round_lots_down,
     step_decimals,
+    validate_stops,
 )
 from mt5.engine.strategy import PositionState, SymbolSpec
 
@@ -86,6 +88,15 @@ class MarginTests(unittest.TestCase):
         chk = check_margin(0.1, 1.1, 100_000, 1000, 10_000, 0.8)
         self.assertTrue(chk.ok)
 
+    def test_margin_accepts_connector_string_leverage(self):
+        chk = check_margin(0.1, 1.1, 100_000, "1000", 10_000)
+        self.assertTrue(chk.ok)
+        self.assertAlmostEqual(chk.margin_required, 11.0)
+        self.assertAlmostEqual(check_margin(0.1, 1.1, 100_000, "1:500", 10_000).margin_required, 22.0)
+        # levier illisible ou nul → défaut 100, jamais d'exception
+        self.assertAlmostEqual(check_margin(0.1, 1.1, 100_000, "n/a", 10_000).margin_required, 110.0)
+        self.assertAlmostEqual(check_margin(0.1, 1.1, 100_000, 0, 10_000).margin_required, 110.0)
+
 
 class GuardTests(unittest.TestCase):
     def test_daily_loss_from_fills(self):
@@ -97,15 +108,69 @@ class GuardTests(unittest.TestCase):
             {"sans": "rien"},  # illisible
             "chaine",  # illisible
         ]
-        total, counted, ignored = realized_pnl_today(fills, today)
+        total, counted, ignored, non_trading = realized_pnl_today(fills, today)
         self.assertAlmostEqual(total, -350.0)
         self.assertEqual(counted, 2)
         self.assertEqual(ignored, 2)
+        self.assertEqual(non_trading, 0)
         blocked, warnings = guard_daily_loss(fills, 10_000, 3.0, today)
         self.assertEqual(blocked[0].rule, "max_daily_loss")
         self.assertTrue(any("illisible" in w for w in warnings))
         self.assertEqual(guard_daily_loss(fills, 10_000, 5.0, today)[0], [])
         self.assertEqual(guard_daily_loss(None, 10_000, 3.0, today)[0], [])
+
+    def test_daily_loss_ignores_balance_deals(self):
+        today = date(2026, 9, 25)
+        # Forme réelle d'Axi (dépôt sur la démo) : action « dealbalance », symbole vide, volume 0.
+        deposit = {"dealId": 89842889, "action": "dealbalance", "entry": "entryin", "symbol": "", "volumeLots": 0,
+                   "profit": 10000, "swap": 0, "commission": 0, "time": "2026-09-25T11:53:32.908+00:00"}
+        loss = {"action": "dealsell", "entry": "entryout", "symbol": "EURUSD", "volumeLots": 0.5,
+                "profit": -500, "commission": -7, "time": "2026-09-25T13:00:00+00:00"}
+        self.assertTrue(is_non_trading_deal(deposit))
+        self.assertFalse(is_non_trading_deal(loss))
+        total, counted, ignored, non_trading = realized_pnl_today([deposit, loss], today)
+        self.assertAlmostEqual(total, -507.0)
+        self.assertEqual((counted, ignored, non_trading), (1, 0, 1))
+        blocked, warnings = guard_daily_loss([deposit, loss], 9_500, 3.0, today)
+        self.assertEqual([b.rule for b in blocked], ["max_daily_loss"])
+        self.assertTrue(any("solde" in w for w in warnings))
+        # Forme générique du schéma du connecteur : action « balance » / entry « in ».
+        generic = [
+            {"action": "balance", "entry": "in", "profit": 10000.0, "time": "2026-09-25T08:00:00Z"},
+            {"action": "sell", "entry": "out", "profit": -400.0, "time": "2026-09-25T09:00:00Z"},
+        ]
+        self.assertAlmostEqual(realized_pnl_today(generic, today)[0], -400.0)
+        self.assertEqual(guard_daily_loss(generic, 10_000, 3.0, today)[0][0].rule, "max_daily_loss")
+        # Un retrait ne bloque pas non plus à tort.
+        withdrawal = [{"action": "dealbalance", "symbol": "", "volumeLots": 0, "profit": -5000, "time": "2026-09-25T08:00:00Z"}]
+        self.assertEqual(guard_daily_loss(withdrawal, 5_000, 3.0, today)[0], [])
+
+    def test_daily_loss_reference_is_day_start_balance(self):
+        # Solde actuel 9 705 après une perte de 295 : la limite est 3 % de 10 000 (début de journée) = 300 → pas bloqué.
+        today = date(2026, 9, 25)
+        fills = [{"profit": -295.0, "time": "2026-09-25T09:00:00Z"}]
+        self.assertEqual(guard_daily_loss(fills, 10_000 - 295, 3.0, today)[0], [])
+        fills = [{"profit": -300.0, "time": "2026-09-25T09:00:00Z"}]
+        self.assertEqual(len(guard_daily_loss(fills, 10_000 - 300, 3.0, today)[0]), 1)
+
+    def test_validate_stops_against_bid_ask(self):
+        spec = SymbolSpec.default_fx()
+        bid, ask = 1.10000, 1.10006
+        self.assertEqual(validate_stops("buy", 1.09500, 1.11000, bid, ask, spec), [])
+        self.assertEqual(validate_stops("sell", 1.10500, 1.09000, bid, ask, spec), [])
+        self.assertEqual(validate_stops("buy", None, None, bid, ask, spec), [])
+        # SL d'achat entre bid et ask : sous le prix d'entrée mais au-dessus du bid → invalide
+        self.assertEqual([b.rule for b in validate_stops("buy", 1.10003, 1.11, bid, ask, spec)], ["invalid_stops"])
+        # TP d'achat sous le bid, SL de vente sous le ask, TP de vente au-dessus du ask
+        self.assertEqual(len(validate_stops("buy", 1.095, 1.09999, bid, ask, spec)), 1)
+        self.assertEqual(len(validate_stops("sell", 1.10005, 1.09, bid, ask, spec)), 1)
+        self.assertEqual(len(validate_stops("sell", 1.105, 1.10007, bid, ask, spec)), 1)
+        # stopsLevel : distance minimale mesurée depuis le bid (achat) / ask (vente)
+        spec.stops_level = 10
+        self.assertEqual(len(validate_stops("buy", 1.095, 1.10008, bid, ask, spec)), 1)  # TP à 8 points du bid
+        self.assertEqual(validate_stops("buy", 1.095, 1.10010, bid, ask, spec), [])      # exactement 10 points
+        self.assertEqual(len(validate_stops("sell", 1.10015, 1.09, bid, ask, spec)), 1)  # SL à 9 points du ask
+        self.assertEqual(validate_stops("sell", 1.10016, 1.09, bid, ask, spec), [])
 
     def test_daily_loss_amount(self):
         self.assertEqual(guard_daily_loss_amount(-299.0, 10_000, 3.0), [])
@@ -150,6 +215,9 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard_friday_cutoff(saturday, 20)[0].rule, "weekend")
         self.assertEqual(guard_friday_cutoff(sunday_20, 20)[0].rule, "weekend")
         self.assertEqual(guard_friday_cutoff(sunday_22, 20), [])
+        # cutoff None = règle entièrement désactivée, week-end compris (symboles 24/7)
+        self.assertEqual(guard_friday_cutoff(saturday, None), [])
+        self.assertEqual(guard_friday_cutoff(sunday_20, None), [])
 
     def test_trade_mode(self):
         self.assertEqual(guard_trade_mode("full", "buy"), [])

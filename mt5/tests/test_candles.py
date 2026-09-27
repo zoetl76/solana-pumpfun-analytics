@@ -53,14 +53,14 @@ class LoadCandlesTests(unittest.TestCase):
 
     def test_load_sorts_and_dedups(self):
         records = [
-            _rec("2026-09-24T02:00:00+00:00", c=1.3),
+            _rec("2026-09-24T02:00:00+00:00", c=1.19),
             _rec("2026-09-24T00:00:00Z", c=1.1),
-            _rec("2026-09-24T01:00:00+00:00", c=1.2),
-            _rec("2026-09-24T01:00:00+00:00", c=1.25),  # doublon : la dernière gagne
+            _rec("2026-09-24T01:00:00+00:00", c=1.12),
+            _rec("2026-09-24T01:00:00+00:00", c=1.15),  # doublon : la dernière gagne
         ]
         candles = load_candles(self._write(records))
         self.assertEqual(len(candles), 3)
-        self.assertEqual([c.close for c in candles], [1.1, 1.25, 1.3])
+        self.assertEqual([c.close for c in candles], [1.1, 1.15, 1.19])
         self.assertTrue(all(candles[i].time < candles[i + 1].time for i in range(2)))
         self.assertEqual(candles[0].spread_points, 6)
         self.assertEqual(candles[0].tick_volume, 10)
@@ -75,6 +75,15 @@ class LoadCandlesTests(unittest.TestCase):
     def test_invalid_low_gt_high(self):
         with self.assertRaises(ValueError):
             candles_from_records([_rec("2026-09-24T00:00:00Z", h=1.0, l=1.2)])
+
+    def test_invalid_open_close_outside_range(self):
+        with self.assertRaises(ValueError):
+            candles_from_records([_rec("2026-09-24T00:00:00Z", o=1.0, h=1.1, l=0.9, c=5.0)])
+        with self.assertRaises(ValueError):
+            candles_from_records([_rec("2026-09-24T00:00:00Z", o=0.5, h=1.1, l=0.9, c=1.0)])
+        # bornes incluses : open = low et close = high sont valides
+        c = candles_from_records([_rec("2026-09-24T00:00:00Z", o=0.9, h=1.1, l=0.9, c=1.1)])[0]
+        self.assertEqual((c.open, c.close), (0.9, 1.1))
 
     def test_missing_field(self):
         with self.assertRaises(ValueError):

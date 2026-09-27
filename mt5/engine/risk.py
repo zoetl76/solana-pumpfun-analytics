@@ -155,6 +155,15 @@ class MarginCheck:
     detail: str = ""
 
 
+def coerce_leverage(value: Any, default: float = 100.0) -> float:
+    """Convertit le levier du connecteur (``"1000"``, ``"1:500"``, 500) en float > 0."""
+    try:
+        leverage = float(str(value).replace("1:", "").strip() or default)
+    except (TypeError, ValueError):
+        leverage = default
+    return leverage if leverage > 0 else default
+
+
 def check_margin(
     lots: float,
     price: float,
@@ -172,8 +181,7 @@ def check_margin(
     taux de marge spécifiques par symbole et la conversion de devise pour les
     croisements exotiques. Elle est volontairement prudente via ``cap``.
     """
-    if leverage <= 0:
-        leverage = 1.0
+    leverage = coerce_leverage(leverage)
     required = lots * contract_size * price / leverage
     allowed = max(0.0, margin_free) * cap
     per_lot = contract_size * price / leverage
@@ -191,26 +199,53 @@ def check_margin(
 # --------------------------------------------------------------------------- #
 _PROFIT_KEYS = ("profit", "pnl", "realisedPnl", "realizedPnl", "realised_pnl", "realized_pnl")
 _TIME_KEYS = ("time", "timeCreate", "dealTime", "timeDone", "closeTime")
+_ACTION_KEYS = ("action", "type", "dealType", "entryType")
+# Deals qui ne sont PAS du trading : dépôt/retrait (balance), crédit, bonus,
+# corrections… Leur ``profit`` est le montant du mouvement et ne doit jamais
+# entrer dans le PnL du jour (sinon un dépôt masque les pertes réelles).
+_NON_TRADING_MARKERS = ("balance", "credit", "bonus", "correction", "charge", "interest", "dividend")
 
 
-def realized_pnl_today(fills: Any, today: date) -> tuple[float, int, int]:
-    """Somme du profit réalisé des exécutions datées de ``today`` (UTC).
+def is_non_trading_deal(entry: dict[str, Any]) -> bool:
+    """Vrai si le deal est une opération de solde (dépôt, retrait, crédit…)."""
+    for key in _ACTION_KEYS:
+        value = entry.get(key)
+        if isinstance(value, str) and any(marker in value.lower() for marker in _NON_TRADING_MARKERS):
+            return True
+    # Repli : symbole vide ET volume nul (forme des deals « dealbalance » d'Axi).
+    if "symbol" in entry and not entry.get("symbol"):
+        try:
+            if float(entry.get("volumeLots", entry.get("volume", 0)) or 0.0) == 0.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
-    Analyse défensive : retourne ``(total, nb_pris_en_compte, nb_ignores)``.
-    Les entrées sans profit ou sans heure exploitables sont ignorées.
+
+def realized_pnl_today(fills: Any, today: date) -> tuple[float, int, int, int]:
+    """Somme du profit réalisé des exécutions de TRADING datées de ``today`` (UTC).
+
+    Analyse défensive : retourne ``(total, nb_pris_en_compte, nb_illisibles,
+    nb_operations_de_solde)``. Les entrées sans profit ou sans heure
+    exploitables sont ignorées ; les opérations de solde (dépôt, retrait,
+    crédit, correction — voir ``is_non_trading_deal``) sont exclues du total.
     """
     if fills is None:
-        return 0.0, 0, 0
+        return 0.0, 0, 0, 0
     if isinstance(fills, dict):
         fills = fills.get("fills", fills.get("deals", fills.get("data", [])))
     if not isinstance(fills, list):
-        return 0.0, 0, 1
+        return 0.0, 0, 1, 0
     total = 0.0
     counted = 0
     ignored = 0
+    non_trading = 0
     for entry in fills:
         if not isinstance(entry, dict):
             ignored += 1
+            continue
+        if is_non_trading_deal(entry):
+            non_trading += 1
             continue
         profit: float | None = None
         for key in _PROFIT_KEYS:
@@ -241,7 +276,7 @@ def realized_pnl_today(fills: Any, today: date) -> tuple[float, int, int]:
                     pass
             total += profit + extra
             counted += 1
-    return total, counted, ignored
+    return total, counted, ignored, non_trading
 
 
 def guard_daily_loss_amount(realized_today: float, reference_balance: float, max_daily_loss_pct: float | None) -> list[Blocked]:
@@ -260,15 +295,24 @@ def guard_daily_loss_amount(realized_today: float, reference_balance: float, max
     return []
 
 
-def guard_daily_loss(fills: Any, reference_balance: float, max_daily_loss_pct: float | None, today: date) -> tuple[list[Blocked], list[str]]:
-    """Version « fichier fills.json » : retourne ``(bloqués, avertissements)``."""
-    total, counted, ignored = realized_pnl_today(fills, today)
+def guard_daily_loss(fills: Any, current_balance: float, max_daily_loss_pct: float | None, today: date) -> tuple[list[Blocked], list[str]]:
+    """Version « fichier fills.json » : retourne ``(bloqués, avertissements)``.
+
+    ``current_balance`` est le solde ACTUEL du compte (déjà diminué des pertes
+    du jour) ; la limite est calculée sur le solde de début de journée,
+    reconstitué comme ``current_balance − PnL réalisé du jour``, exactement
+    comme le backtester (référence = solde au début du jour).
+    """
+    total, counted, ignored, non_trading = realized_pnl_today(fills, today)
     warnings: list[str] = []
     if ignored:
         warnings.append(f"{ignored} exécution(s) illisible(s) ignorée(s) dans fills.json")
+    if non_trading:
+        warnings.append(f"{non_trading} opération(s) de solde (dépôt/retrait/crédit) exclue(s) du PnL du jour")
     if counted:
         warnings.append(f"PnL réalisé du jour ({today.isoformat()}) : {total:.2f} sur {counted} exécution(s)")
-    return guard_daily_loss_amount(total, reference_balance, max_daily_loss_pct), warnings
+    day_start_balance = current_balance - total if counted else current_balance
+    return guard_daily_loss_amount(total, day_start_balance, max_daily_loss_pct), warnings
 
 
 def guard_max_positions(positions: Iterable[PositionState], symbol: str, max_positions: int) -> list[Blocked]:
@@ -309,14 +353,63 @@ def guard_trading_hours(now: datetime, hours: tuple[int, int] | None) -> list[Bl
 
 
 def guard_friday_cutoff(now: datetime, cutoff_hour: int | None) -> list[Blocked]:
-    """Bloque les ouvertures le vendredi à partir de ``cutoff_hour`` UTC et le week-end."""
+    """Bloque les ouvertures le vendredi à partir de ``cutoff_hour`` UTC et le week-end.
+
+    ``cutoff_hour=None`` désactive ENTIÈREMENT la règle (vendredi ET week-end),
+    ce qui est nécessaire pour les symboles cotés 24h/24 et 7j/7 (crypto CFD).
+    """
+    if cutoff_hour is None:
+        return []
     utc = now.astimezone(timezone.utc)
     weekday = utc.weekday()  # 0 = lundi … 4 = vendredi, 5 = samedi, 6 = dimanche
     if weekday == 5 or (weekday == 6 and utc.hour < 21):
         return [Blocked("weekend", f"marché fermé le week-end ({utc.strftime('%A %H:%M')} UTC)")]
-    if cutoff_hour is not None and weekday == 4 and utc.hour >= cutoff_hour:
+    if weekday == 4 and utc.hour >= cutoff_hour:
         return [Blocked("friday_cutoff", f"vendredi {utc.strftime('%H:%M')} UTC ≥ {cutoff_hour:02d}h : pas de nouvelle position avant le week-end")]
     return []
+
+
+def validate_stops(
+    side: str,
+    sl: float | None,
+    tp: float | None,
+    bid: float,
+    ask: float,
+    spec: SymbolSpec,
+    label: str = "",
+) -> list[Blocked]:
+    """Vérifie SL/TP comme le ferait le serveur MT5 (règle ``invalid_stops``).
+
+    Un ACHAT se clôture au bid : SL < bid − stopsLevel×point et TP > bid + stopsLevel×point.
+    Une VENTE se clôture au ask : SL > ask + stopsLevel×point et TP < ask − stopsLevel×point.
+    Vérifier le SL d'un achat contre le ask (prix d'entrée) laisserait passer un
+    SL situé entre bid et ask, immédiatement déclenché avec une taille énorme.
+    """
+    side = side.lower()
+    min_dist = max(0, spec.stops_level) * spec.point
+    ref = bid if side == "buy" else ask
+    ref_name = "bid" if side == "buy" else "ask"
+    prefix = f"{label} : " if label else ""
+    blocked: list[Blocked] = []
+    fmt = f"{{:.{spec.digits}f}}"
+
+    def _far_enough(level: float, below: bool) -> bool:
+        gap = (ref - level) if below else (level - ref)
+        return gap + 1e-12 >= min_dist and gap > 0
+
+    if sl is not None and not _far_enough(sl, below=(side == "buy")):
+        blocked.append(Blocked(
+            "invalid_stops",
+            f"{prefix}SL {fmt.format(sl)} trop proche ou du mauvais côté du {ref_name} {fmt.format(ref)} "
+            f"({side}, stopsLevel {spec.stops_level} point(s))",
+        ))
+    if tp is not None and not _far_enough(tp, below=(side == "sell")):
+        blocked.append(Blocked(
+            "invalid_stops",
+            f"{prefix}TP {fmt.format(tp)} trop proche ou du mauvais côté du {ref_name} {fmt.format(ref)} "
+            f"({side}, stopsLevel {spec.stops_level} point(s))",
+        ))
+    return blocked
 
 
 def guard_trade_mode(trade_mode: str | None, direction: str) -> list[Blocked]:
@@ -346,8 +439,9 @@ def guard_session(trade_session_open: bool | None, opens_at: str | None = None) 
 
 __all__ = [
     "RiskConfig", "Blocked", "LotSizing", "MarginCheck",
-    "step_decimals", "round_lots_down", "compute_lots", "check_margin",
-    "realized_pnl_today", "guard_daily_loss_amount", "guard_daily_loss",
+    "step_decimals", "round_lots_down", "compute_lots", "coerce_leverage", "check_margin",
+    "is_non_trading_deal", "realized_pnl_today", "guard_daily_loss_amount", "guard_daily_loss",
+    "validate_stops",
     "guard_max_positions", "guard_spread", "in_trading_hours", "guard_trading_hours",
     "guard_friday_cutoff", "guard_trade_mode", "guard_session",
 ]

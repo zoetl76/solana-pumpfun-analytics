@@ -207,6 +207,114 @@ class RunCycleTests(unittest.TestCase):
         res = self._run(AlwaysBuy(), risk=RiskConfig(max_positions_per_symbol=5))
         self.assertEqual(sum(1 for a in res["actions"] if a["type"] == "open"), 1)
 
+    def test_stops_validated_against_bid_ask_not_entry(self):
+        class SlBetweenBidAsk(Strategy):
+            name = "sl_between"
+
+            def on_bar(self, ctx: Context):
+                return Signal("buy", sl=ctx.close + 0.00003, tp=ctx.close + 0.0100)  # bid 1.10000 < SL 1.10003 < ask 1.10006
+
+        res = self._run(SlBetweenBidAsk())
+        self.assertEqual(res["actions"], [])
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["invalid_stops"])
+
+        class TpTooClose(Strategy):
+            name = "tp_close"
+
+            def on_bar(self, ctx: Context):
+                return Signal("buy", sl=ctx.close - 0.0050, tp=ctx.close + 0.00008)
+
+        spec = SymbolSpec.default_fx("EURUSD")
+        spec.stops_level = 10
+        res = run_cycle(TpTooClose(), "EURUSD", candles(), [], account(), quote(), spec, RiskConfig(), now=NOW)
+        self.assertEqual(res["actions"], [])
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["invalid_stops"])
+        # Vente : SL sous le ask
+        class SellSlBelowAsk(Strategy):
+            name = "sell_bad"
+
+            def on_bar(self, ctx: Context):
+                return Signal("sell", sl=ctx.close + 0.00004, tp=ctx.close - 0.0100)
+
+        res = self._run(SellSlBelowAsk())
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["invalid_stops"])
+
+    def test_missing_fills_warns_daily_loss_not_checked(self):
+        res = self._run(AlwaysBuy(), fills=None, risk=RiskConfig(max_daily_loss_pct=3.0))
+        self.assertEqual(res["actions"][0]["type"], "open")
+        self.assertTrue(any("fills.json absent" in w for w in res["warnings"]))
+        res = self._run(AlwaysBuy(), fills=[], risk=RiskConfig(max_daily_loss_pct=3.0))
+        self.assertFalse(any("fills.json absent" in w for w in res["warnings"]))
+        res = self._run(AlwaysBuy(), fills=None, risk=RiskConfig(max_daily_loss_pct=0))
+        self.assertFalse(any("fills.json absent" in w for w in res["warnings"]))
+
+    def test_modify_blocked_when_new_sl_above_bid(self):
+        pos = [position(LAST_OPEN - timedelta(hours=5), sl=1.09500)]
+        res = self._run(Trailing({"delta": 0.0060}), positions=pos)  # SL 1.10100 > bid 1.10000 pour un achat
+        self.assertEqual(res["actions"], [])
+        self.assertIn("invalid_stops", [b["rule"] for b in res["blocked"]])
+        self.assertTrue(any("modification de 123" in w for w in res["warnings"]))
+
+    def test_max_positions_reported_in_blocked(self):
+        res = self._run(AlwaysBuy(), positions=[position(LAST_OPEN - timedelta(hours=5))])
+        self.assertEqual(res["actions"], [])
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["max_positions"])
+
+    def test_daily_loss_reference_is_day_start_balance(self):
+        # Perte de 295 déjà déduite du solde (9 705) : limite = 3 % de 10 000 → pas bloqué (comme le backtest).
+        fills = [{"profit": -295.0, "time": NOW.isoformat()}]
+        res = self._run(AlwaysBuy(), acc=account(10_000 - 295), fills=fills, risk=RiskConfig(max_daily_loss_pct=3.0))
+        self.assertEqual(res["blocked"], [])
+        fills = [{"profit": -300.0, "time": NOW.isoformat()}]
+        res = self._run(AlwaysBuy(), acc=account(10_000 - 300), fills=fills, risk=RiskConfig(max_daily_loss_pct=3.0))
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["max_daily_loss"])
+
+    def test_modify_serializes_unset_levels_as_zero(self):
+        pos = position(LAST_OPEN - timedelta(hours=5), sl=1.09500)
+        pos["priceTP"] = None
+        res = self._run(Trailing(), positions=[pos])
+        act = res["actions"][0]
+        self.assertEqual(act["type"], "modify")
+        self.assertEqual(act["priceTP"], 0.0)
+        self.assertIsInstance(act["priceTP"], float)
+        pos["priceTP"] = 0
+        res = self._run(Trailing(), positions=[pos])
+        self.assertEqual(res["actions"][0]["priceTP"], 0.0)
+
+    def test_open_serializes_missing_tp_as_zero(self):
+        class NoTp(Strategy):
+            name = "no_tp"
+
+            def on_bar(self, ctx: Context):
+                return Signal("buy", sl=ctx.close - 0.0050, tp=None)
+
+        res = self._run(NoTp())
+        self.assertEqual(res["actions"][0]["priceTP"], 0.0)
+
+    def test_now_prefers_account_asof_over_stale_quote_time(self):
+        acc = account()
+        acc["asOf"] = "2026-09-22T07:03:10+00:00"
+        q = quote(time="2026-09-22T06:59:58+00:00")  # dernier tick de l'heure précédente
+        res = run_cycle(AlwaysBuy(), "EURUSD", candles(), [], acc, q, SPEC, RiskConfig(trading_hours_utc=(7, 21)))
+        self.assertEqual(res["blocked"], [])
+        self.assertEqual(res["actions"][0]["type"], "open")
+        # Passage de minuit : la perte de la veille ne compte plus au cycle de 00:03.
+        acc["asOf"] = "2026-09-23T00:03:10+00:00"
+        q = quote(time="2026-09-22T23:59:57+00:00")
+        fills = [{"profit": -400.0, "time": "2026-09-22T15:00:00+00:00"}]
+        res = run_cycle(AlwaysBuy(), "EURUSD", candles(), [], acc, q, SPEC, RiskConfig(max_daily_loss_pct=3.0), fills_raw=fills)
+        self.assertEqual(res["blocked"], [])
+        # Sans asOf, repli sur l'heure de la cotation.
+        del acc["asOf"]
+        res = run_cycle(AlwaysBuy(), "EURUSD", candles(), [], acc, q, SPEC, RiskConfig(max_daily_loss_pct=3.0), fills_raw=fills)
+        self.assertEqual([b["rule"] for b in res["blocked"]], ["max_daily_loss"])
+
+    def test_modify_warns_when_session_closed(self):
+        res = self._run(Trailing(), positions=[position(LAST_OPEN - timedelta(hours=5))],
+                        quote_raw=quote(tradeSessionOpen=False))
+        self.assertEqual([a["type"] for a in res["actions"]], ["modify"])
+        self.assertTrue(any("session fermée" in w and "modification" in w for w in res["warnings"]))
+
 
 def ema_cross_candles() -> list[Candle]:
     """Série synthétique dont la DERNIÈRE bougie porte un croisement EMA9 > EMA21."""
@@ -238,6 +346,8 @@ class CycleCliTests(unittest.TestCase):
         now = last_open + timedelta(hours=1, minutes=3)
         bid = round(cnd[-1].close, 5)
         q = quote(time=now.isoformat(), bid=bid, ask=round(bid + 0.00006, 5))
+        acc = account()
+        acc["asOf"] = now.isoformat()
         spec = {
             "symbol": "EURUSD", "digits": 5, "contractSize": 100000, "currencyBase": "EUR", "currencyProfit": "USD",
             "volumeMinLots": 0.01, "volumeMaxLots": 100, "volumeStepLots": 0.01, "stopsLevel": 1, "freezeLevel": 0,
@@ -248,7 +358,7 @@ class CycleCliTests(unittest.TestCase):
             "--strategy", "ema_cross", "--symbol", "EURUSD",
             "--candles", self._write("candles.json", candles_to_json(cnd)),
             "--positions", self._write("positions.json", positions),
-            "--account", self._write("account.json", account()),
+            "--account", self._write("account.json", acc),
             "--quote", self._write("quote.json", q),
             "--spec", self._write("symbol.json", spec),
             "--out", self.out, "--quiet", *extra,
@@ -299,6 +409,17 @@ class CycleCliTests(unittest.TestCase):
         self.assertEqual(main(["--strategy", "ema_cross", "--symbol", "EURUSD", "--candles", empty,
                                "--positions", empty, "--account", acc]), 2)
         self.assertIn("Erreur d'entrée", self._err.getvalue())
+
+    def test_cli_help_in_french(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+            main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = out.getvalue()
+        self.assertIn("utilisation :", text)
+        self.assertIn("afficher cette aide", text)
+        for english in ("usage:", "options:", "show this help"):
+            self.assertNotIn(english, text)
 
     def test_cli_with_patched_strategy_registry(self):
         cnd = candles()

@@ -88,16 +88,21 @@ def rsi(values: Series, period: int = 14) -> Out:
         return _clean(out)
     avg_gain = 0.0
     avg_loss = 0.0
+    seeded = 0  # nombre de variations valides accumulées dans l'amorce
     for i in range(1, n):
         if math.isnan(data[i]) or math.isnan(data[i - 1]):
+            # Valeur manquante : on repart de zéro (nouvelle chauffe de ``period`` variations).
+            avg_gain = avg_loss = 0.0
+            seeded = 0
             continue
         change = data[i] - data[i - 1]
         gain = max(change, 0.0)
         loss = max(-change, 0.0)
-        if i <= period:
+        if seeded < period:
             avg_gain += gain / period
             avg_loss += loss / period
-            if i == period:
+            seeded += 1
+            if seeded == period:
                 out[i] = _rsi_value(avg_gain, avg_loss)
         else:
             avg_gain = (avg_gain * (period - 1) + gain) / period
@@ -155,6 +160,8 @@ def atr(highs: Series, lows: Series, closes: Series, period: int = 14) -> Out:
 
 def stddev(values: Series, period: int) -> Out:
     """Écart-type (population, comme MetaTrader) glissant sur ``period`` valeurs."""
+    if period <= 0:
+        raise ValueError("period doit être > 0")
     data = _valid(values)
     out: list[float] = [float("nan")] * len(data)
     for i in range(period - 1, len(data)):
@@ -197,6 +204,8 @@ def macd(values: Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tup
 
 def highest(values: Series, period: int) -> Out:
     """Plus haut glissant sur ``period`` valeurs (incluant la valeur courante)."""
+    if period <= 0:
+        raise ValueError("period doit être > 0")
     data = _valid(values)
     out: list[float] = [float("nan")] * len(data)
     for i in range(period - 1, len(data)):
@@ -209,6 +218,8 @@ def highest(values: Series, period: int) -> Out:
 
 def lowest(values: Series, period: int) -> Out:
     """Plus bas glissant sur ``period`` valeurs (incluant la valeur courante)."""
+    if period <= 0:
+        raise ValueError("period doit être > 0")
     data = _valid(values)
     out: list[float] = [float("nan")] * len(data)
     for i in range(period - 1, len(data)):
