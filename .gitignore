@@ -11,3 +11,8 @@ logs/
 node_modules/
 .DS_Store
 *.log
+
+# Python / moteur MT5
+__pycache__/
+mt5/runtime/
+mt5/logs/
