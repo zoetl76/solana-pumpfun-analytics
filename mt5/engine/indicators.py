@@ -35,11 +35,19 @@ def sma(values: Series, period: int) -> Out:
     data = _valid(values)
     out: list[float] = [float("nan")] * len(data)
     window_sum = 0.0
+    nan_in_window = 0  # nombre de valeurs manquantes dans la fenêtre courante
     for i, v in enumerate(data):
-        window_sum += v
+        if math.isnan(v):
+            nan_in_window += 1
+        else:
+            window_sum += v
         if i >= period:
-            window_sum -= data[i - period]
-        if i >= period - 1:
+            leaving = data[i - period]
+            if math.isnan(leaving):
+                nan_in_window -= 1
+            else:
+                window_sum -= leaving
+        if i >= period - 1 and nan_in_window == 0:
             out[i] = window_sum / period
     return _clean(out)
 
