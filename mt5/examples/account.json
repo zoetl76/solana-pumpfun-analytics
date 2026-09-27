@@ -1,0 +1,10 @@
+{
+  "cashBalance": 10000.0,
+  "creditBalance": 0.0,
+  "equity": 10000.0,
+  "marginFree": 10000.0,
+  "marginRequirement": 0.0,
+  "leverage": "1000",
+  "currencyCode": "USD",
+  "asOf": "2026-09-25T20:03:00+00:00"
+}

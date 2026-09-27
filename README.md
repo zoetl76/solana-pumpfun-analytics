@@ -136,3 +136,9 @@ Conclusion empirique : le rug n'est pas un risque, c'est le **comportement par d
 
 # Ce que ça ne fait PAS
 Aucun trade. Aucun ordre. Aucune clé privée. Lecture seule, point.
+
+# Moteur MT5 (dossier `mt5/`)
+Un package Python autonome (bibliothèque standard, Python 3.11) pour backtester et piloter une
+stratégie sur les comptes Axi MT5 via le connecteur : voir **[`mt5/README.md`](mt5/README.md)**
+(installation, cycle 24/5, garde-fous, commandes) et **[`mt5/STRATEGIE.md`](mt5/STRATEGIE.md)** (fiche stratégie à remplir).
+Tests : `python3 -m unittest discover -s mt5/tests -t . -v`.

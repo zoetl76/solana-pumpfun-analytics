@@ -1,0 +1,14 @@
+{
+  "symbol": "EURUSD",
+  "digits": 5,
+  "point": 1E-05,
+  "contractSize": 100000,
+  "currencyBase": "EUR",
+  "currencyProfit": "USD",
+  "volumeMinLots": 0.01,
+  "volumeMaxLots": 100,
+  "volumeStepLots": 0.01,
+  "stopsLevel": 1,
+  "freezeLevel": 0,
+  "tradeMode": "full"
+}

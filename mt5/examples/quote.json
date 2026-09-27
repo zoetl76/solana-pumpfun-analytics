@@ -1,0 +1,12 @@
+{
+  "symbol": "EURUSD",
+  "bid": 1.13909,
+  "ask": 1.13915,
+  "last": 0,
+  "spread": 6E-05,
+  "point": 1E-05,
+  "time": "2026-09-25T20:02:58+00:00",
+  "tradeMode": "full",
+  "tradeSessionOpen": true,
+  "tradeSessionOpens": null
+}

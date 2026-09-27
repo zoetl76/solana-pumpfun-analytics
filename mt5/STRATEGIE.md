@@ -75,16 +75,16 @@ Exécution : ouverture au marché à la bougie suivante, au prix ask.
 |---|---|
 | Méthode | risque en % de l'equity / lots fixes |
 | Valeur | `…… %` ou `…… lots` |
-| Lots max par position | `……` |
-| Arrondi | au pas du symbole, vers le bas (par défaut) |
+| Lots max par position | `……` — le moteur ne connaît que `volumeMaxLots` du symbole ; ce plafond est vérifié par Claude sur `actions.json` avant exécution |
+| Arrondi | au pas du symbole, vers le bas (par défaut) ; si le résultat est sous le lot minimum, le minimum est appliqué avec un avertissement |
 
 ## 9. Filtres
 
 | Filtre | Ta réponse |
 |---|---|
-| Heures UTC autorisées pour les entrées | `HH–HH` ou « toutes » |
+| Heures UTC autorisées pour les entrées | `HH–HH` (fin exclusive, plage de nuit possible) ou « toutes » |
 | Jours autorisés | lun–ven / autre |
-| Pas de nouvelle entrée le vendredi après | `HH` UTC (défaut 20) |
+| Pas de nouvelle entrée le vendredi après | `HH` UTC (défaut 20 ; le week-end est toujours bloqué, sauf si la règle est désactivée avec `--friday-cutoff-hour -1`) |
 | Spread max (points) | `……` |
 | News | pas de filtre automatique ; si tu veux exclure des plages (ex. NFP), donne-les en UTC et je les applique à la main dans la Routine |
 
@@ -93,11 +93,11 @@ Exécution : ouverture au marché à la bougie suivante, au prix ask.
 | Limite | Ta réponse |
 |---|---|
 | Positions max par symbole | `1` (défaut) |
-| Positions max au total | `……` |
-| Perte max journalière (% equity, réalisée) | `……` (défaut 3) |
+| Positions max au total | `……` — non implémentée dans le moteur v1 (une limite par symbole seulement, `--max-positions`) ; appliquée par Claude via `get_mt5_positions` |
+| Perte max journalière (% du solde de début de journée, réalisée via `fills.json`) | `……` (défaut 3) |
 | Perte max hebdomadaire (% equity) | `……` — non implémentée dans le moteur v1 ; je peux l'ajouter ou l'appliquer via l'historique d'ordres à chaque cycle |
 | Marge utilisée max (part de la marge libre) | `0,8` (défaut) |
-| Que faire si une limite est atteinte | ne plus ouvrir jusqu'au lendemain / fermer aussi les positions ouvertes |
+| Que faire si une limite est atteinte | ne plus ouvrir jusqu'au lendemain (comportement du moteur) / fermer aussi les positions ouvertes (à faire par Claude, le moteur ne le fait pas) |
 
 ## 11. Autorisation d'exécution
 
@@ -167,8 +167,8 @@ Symétrique : EMA(9) passe **strictement en dessous** de EMA(21) sur la bougie `
 |---|---|---|
 | Stop loss | multiple d'ATR | 1,5 × ATR(14) calculé à la clôture de `i`, placé sous (long) ou au-dessus (short) du prix d'entrée, arrondi à 5 décimales |
 | Take profit | RR | 2,0 × la distance du SL, dans le sens du trade |
-| Trailing | aucun | — |
-| Sortie discrétionnaire | signal inverse | croisement opposé à la clôture d'une bougie → fermeture au marché à l'ouverture de la suivante |
+| Trailing | aucun | — (`trail_atr_mult=0` ; une valeur > 0 activerait un SL suivi à N × ATR) |
+| Sortie discrétionnaire | signal inverse | croisement opposé à la clôture d'une bougie → fermeture au marché à l'ouverture de la suivante (backtest) / dès le cycle suivant (live) |
 | Sortie temporelle | aucune | la position peut passer le week-end, protégée par SL/TP |
 
 ### 8. Taille de position
@@ -177,8 +177,8 @@ Symétrique : EMA(9) passe **strictement en dessous** de EMA(21) sur la bougie `
 |---|---|
 | Méthode | risque en % de l'equity |
 | Valeur | 1 % |
-| Lots max par position | 1,00 |
-| Arrondi | vers le bas au pas 0,01 ; si le résultat est < 0,01 ou si la distance du SL est < stopsLevel × point, pas de trade |
+| Lots max par position | 1,00 (vérifié par Claude sur `actions.json` ; le moteur ne plafonne qu'à `volumeMaxLots` = 100) |
+| Arrondi | vers le bas au pas 0,01 ; si le résultat est < 0,01, le minimum 0,01 est appliqué avec un avertissement (risque réel > 1 %) ; si la distance du SL est < stopsLevel × point, pas de trade (`lot_sizing`) |
 
 Formule : `lots = (equity × 1 %) / (|entrée − SL| × 100 000 × 1,0)`. Exemple : equity 10 000 USD, ATR 0,00120 → SL à 0,00180 → risque 100 USD → 100 / (0,00180 × 100 000) = 0,55 lot.
 
@@ -197,8 +197,8 @@ Formule : `lots = (equity × 1 %) / (|entrée − SL| × 100 000 × 1,0)`. Exemp
 | Limite | Réponse |
 |---|---|
 | Positions max par symbole | 1 |
-| Positions max au total | 1 |
-| Perte max journalière | 3 % de l'equity, sur les profits réalisés du jour (`fills.json`) |
+| Positions max au total | 1 (un seul symbole traité, donc équivalent à la limite par symbole) |
+| Perte max journalière | 3 % du solde de début de journée, sur les profits réalisés du jour (`fills.json`, opérations de solde exclues) |
 | Perte max hebdomadaire | aucune |
 | Marge utilisée max | 80 % de la marge libre |
 | Si limite atteinte | plus aucune ouverture jusqu'au jour suivant ; les positions ouvertes gardent leur SL/TP |
