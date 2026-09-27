@@ -264,3 +264,28 @@ Remplis `mt5/STRATEGIE.md` (un exemple complet y figure) ou donne-moi les mêmes
 - [ ] **Autorisation d'exécution** :
   - démo : une phrase du type « J'autorise l'exécution automatique sur le compte démo 10064731 » ;
   - live : la phrase complète avec plafonds, telle que définie dans `STRATEGIE.md`. Sans elle, aucune action live n'est exécutée.
+
+---
+
+## Stratégie « NY Open 9:31 » sur l'or (XAUUSD)
+
+Première stratégie mise en production (compte **démo 10064731**). Elle ne suit pas le modèle horaire ci-dessus : c'est une stratégie **ancrée sur une heure fixe** (bougie M1 de 9h31 New York), exécutée par une **Routine quotidienne** à 9h29 New York qui place deux ordres stop à 9h32 puis supervise jusqu'à la sortie (au plus 11h05).
+
+- Fiche complète et paramètres : [`STRATEGIE_NY_OPEN.md`](STRATEGIE_NY_OPEN.md)
+- Procédure de la session quotidienne (= prompt de la Routine) : [`ROUTINE_NY_OPEN.md`](ROUTINE_NY_OPEN.md)
+- Code : `mt5/strategies/ny_open_931.py` (décision pure), `mt5/engine/nyopen_cycle.py` (CLI live `plan` / `supervise`), `mt5/engine/backtest_nyopen.py` (simulateur M1 bid/ask, OCO, limite de temps)
+- Données : `mt5/data/nyopen/XAUUSD_M1_AAAA-MM.json` (bougies M1 13:25→14:40 UTC de chaque séance, format connecteur)
+- Journal des séances réelles : `mt5/journal/AAAA-MM-JJ.json` (committé par la Routine)
+
+```bash
+# Backtest sur toutes les données disponibles, détail jour par jour
+python3 -m mt5.engine.backtest_nyopen --candles "mt5/data/nyopen/*.json" --balance 10000 --days
+
+# Plan du jour à partir des fichiers du connecteur (voir ROUTINE_NY_OPEN.md)
+python3 -m mt5.engine.nyopen_cycle plan --ref-candle mt5/runtime/candles.json --account mt5/runtime/account.json \
+  --quote mt5/runtime/quote.json --spec mt5/runtime/symbol.json --out mt5/runtime/plan.json
+
+# Supervision : annulation OCO, seconde position, limite de temps
+python3 -m mt5.engine.nyopen_cycle supervise --positions mt5/runtime/positions.json --orders mt5/runtime/orders.json \
+  --fills mt5/runtime/fills.json --day 2026-09-28 --out mt5/runtime/actions.json
+```
